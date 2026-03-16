@@ -133,7 +133,7 @@ class TutankhamConstants(NamedTuple):
     HEIGHT: int = 210
 
     # Player constants
-    PLAYER_SPEED: int = 2
+    PLAYER_SPEED: float = 1.5
     PLAYER_SIZE: chex.Array = jnp.array([5, 8], dtype=jnp.int32)
     PLAYER_LIVES: int = 3
 
@@ -624,8 +624,8 @@ class TutankhamRenderer(JAXGameRenderer):
         flip = jnp.where(state.player_direction == 3, True, False)
         raster = self.jr.render_at_clipped(
             raster,
-            state.player_x,
-            state.player_y - camera_offset,
+            jnp.floor(state.player_x).astype(jnp.int32),
+            jnp.floor(state.player_y).astype(jnp.int32) - camera_offset,
             player_mask,
             flip_offset=ZERO_FLIP,
             flip_horizontal=flip,
@@ -829,9 +829,11 @@ class JaxTutankham(JaxEnvironment):
         teleporters = self.consts.MAP_TELEPORTER_POSITIONS[level%4]  # (N, 5) N teleporters for current map with (x_in, y_in, trigger_action, x_out, y_out)
         teleporter_height = 3 # Define a vertical hitbox for the teleporter
 
+        player_x_int = jnp.floor(player_x).astype(jnp.int32)
+        player_y_int = jnp.floor(player_y).astype(jnp.int32)
         teleport_trigger_action = (teleporters[:, 2] == action) # check if trigger action matches the current action input
-        player_on_teleporter_x = (teleporters[:, 0] == player_x)
-        player_on_teleporter_y_range = (player_y >= teleporters[:, 1]) & (player_y < teleporters[:, 1] + teleporter_height)
+        player_on_teleporter_x = (teleporters[:, 0] == player_x_int)
+        player_on_teleporter_y_range = (player_y_int >= teleporters[:, 1]) & (player_y_int < teleporters[:, 1] + teleporter_height)
 
 
         teleporter_active_mask = player_on_teleporter_x & player_on_teleporter_y_range & teleport_trigger_action
@@ -906,11 +908,21 @@ class JaxTutankham(JaxEnvironment):
 
         new_x = player_x + dx[effective_action]
         new_y = player_y + dy[effective_action]
-        player_x, player_y, is_walkable = can_walk_to(self.consts.PLAYER_SIZE, new_x, new_y, player_x, player_y, self.consts.VALID_POS)
-        
-        # If teleporter is triggered, the player position is set to teleporter out coordinates 
-        player_x = jnp.where(should_teleport, teleporter_out_x, player_x)
-        player_y = jnp.where(should_teleport, teleporter_out_y, player_y)
+        # Walkability check uses integer positions
+        _, _, is_walkable = can_walk_to(
+            self.consts.PLAYER_SIZE,
+            jnp.floor(new_x).astype(jnp.int32), jnp.floor(new_y).astype(jnp.int32),
+            jnp.floor(player_x).astype(jnp.int32), jnp.floor(player_y).astype(jnp.int32),
+            self.consts.VALID_POS)
+        # Apply movement in float sub-pixel space
+        player_x = jnp.where(is_walkable, new_x, player_x)
+        player_y = jnp.where(is_walkable, new_y, player_y)
+        player_x = jnp.clip(player_x, 0.0, float(self.consts.WIDTH - 1))
+        player_y = jnp.clip(player_y, 0.0, float(self.consts.VALID_POS.shape[0] - 1))
+
+        # If teleporter is triggered, the player position is set to teleporter out coordinates
+        player_x = jnp.where(should_teleport, teleporter_out_x.astype(jnp.float32), player_x)
+        player_y = jnp.where(should_teleport, teleporter_out_y.astype(jnp.float32), player_y)
 
         # Animation / orientation state
         is_moving_now = jnp.logical_and(is_walkable, jnp.logical_or(dx[effective_action] != 0, dy[effective_action] != 0))
@@ -918,9 +930,9 @@ class JaxTutankham(JaxEnvironment):
                         jnp.where(dx[effective_action] < 0, 4, player_direction))
         new_step_counter = step_counter + 1
 
-
-        # update camera offset based on player y position
-        camera_offset = jnp.where(player_y < self.consts.HEIGHT // 2, 0, player_y - self.consts.HEIGHT // 2)
+        # update camera offset based on player y position (use integer y)
+        player_y_int = jnp.floor(player_y).astype(jnp.int32)
+        camera_offset = jnp.where(player_y_int < self.consts.HEIGHT // 2, 0, player_y_int - self.consts.HEIGHT // 2)
 
         return player_x, player_y, new_last_directional_action, new_direction, is_moving_now, new_step_counter, camera_offset
 
