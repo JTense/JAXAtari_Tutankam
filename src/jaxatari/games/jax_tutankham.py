@@ -84,7 +84,7 @@ def _get_default_asset_config() -> tuple:
         # Player (loaded as groups for automatic padding to largest sprite)
         {'name': 'player', 'type': 'group', 'files': ['player_idle.npy', 'player_key_idle.npy']},
         {'name': 'player_move', 'type': 'group', 'files': ['player_move_00.npy', 'player_move_01.npy', 'player_key_move_00.npy', 'player_key_move_01.npy']},
-        {'name': 'player_death ', 'type': 'single', 'file': 'player_death.npy'},
+        {'name': 'player_death', 'type': 'single', 'file': 'player_death.npy'},
         {'name': 'bullet', 'type': 'group', 'files': ['bullet_00.npy', 'bullet_01.npy', 'bullet_02.npy', 'bullet_03.npy']},
 
         # Creatures (loaded as single sprites for manual padding)
@@ -101,6 +101,7 @@ def _get_default_asset_config() -> tuple:
         {'name': 'stats', 'type': 'group', 'files': ['ui_stats_1.npy', 'ui_stats_2.npy', 'ui_stats_3.npy']},
         {'name': 'digits', 'type': 'group', 'files': ['digit_0.npy', 'digit_1.npy', 'digit_2.npy', 'digit_3.npy', 'digit_4.npy', 'digit_5.npy', 'digit_6.npy', 'digit_7.npy', 'digit_8.npy', 'digit_9.npy']},
         {'name': 'goal', 'type': 'group', 'files': ['map1_exitdoor.npy', 'map2_exitdoor.npy', 'map3_exitdoor.npy', 'map4_exitdoor.npy']},
+        {'name': 'goal_open', 'type': 'group', 'files': ['map1_exitdoor_after.npy', 'map2_exitdoor_after.npy', 'map3_exitdoor_after.npy', 'map4_exitdoor_after.npy']},
         {'name': 'ui_footer_header', 'type': 'group', 'files': ['ui_map1_footer_header.npy', 'ui_map2_footer_header.npy', 'ui_map3_footer_header.npy', 'ui_map4_footer_header.npy']},
         {'name': 'background', 'type': 'background', 'file': 'background_full.npy'}
     )
@@ -124,6 +125,11 @@ class TutankhamConstants(NamedTuple):
     BULLET_SIZE: chex.Array = jnp.array([1, 2], dtype=jnp.int32)
     BULLET_SPEED: float = 3.5
     BULLET_ANIM_SPEED: int = 4
+    
+    # EVENT STATES: 0=None, 1=PlayerDying, 2=LevelComplete
+    EVENT_NONE: int = 0
+    EVENT_PLAYER_DYING: int = 1
+    EVENT_LEVEL_COMPLETE: int = 2
     #AMMO_SUPPLY: int = 7500  # frames until ammo runs out
 
     MAX_LASER_FLASHES: int = 3
@@ -521,6 +527,9 @@ class TutankhamState(NamedTuple):
     goal_reached: bool  # whether the player has reached the goal with the key to complete the level
 
     last_directional_action: int  # last action that had a directional component
+
+    event_state: int  # 0=None, 1=PlayerDying, 2=LevelComplete
+    event_timer: int  # remaining frames for the current event
 @jax.jit
 def is_onscreen(y: jax.Array, height: jax.Array, camera_offset: jax.Array) -> jnp.ndarray:
     """
@@ -641,14 +650,14 @@ class TutankhamRenderer(JAXGameRenderer):
         key_offset_idle = jnp.where(state.has_key, 1, 0)
         key_offset_move = jnp.where(state.has_key, 2, 0)
 
-        player_mask = jax.lax.cond(
+        player_mask_normal = jax.lax.cond(
             state.is_moving,
             lambda _: self.SHAPE_MASKS['player_move'][frame_idx + key_offset_move],
             lambda _: self.SHAPE_MASKS['player'][key_offset_idle],
             operand=None
         )
         
-        player_flip_offset = jax.lax.cond(
+        player_flip_normal = jax.lax.cond(
             state.is_moving,
             lambda _: self.FLIP_OFFSETS['player_move'],
             lambda _: self.FLIP_OFFSETS['player'],
@@ -656,13 +665,33 @@ class TutankhamRenderer(JAXGameRenderer):
         )
         
         flip = jnp.where(state.player_direction == 3, True, False)
-        raster = self.jr.render_at_clipped(
-            raster,
-            state.player_x,
-            state.player_y - camera_offset,
-            player_mask,
-            flip_offset=player_flip_offset,
-            flip_horizontal=flip,
+        
+        raster = jax.lax.cond(
+            state.event_state != self.consts.EVENT_PLAYER_DYING,
+            lambda r: self.jr.render_at_clipped(
+                r,
+                state.player_x,
+                state.player_y - camera_offset,
+                player_mask_normal,
+                flip_offset=player_flip_normal,
+                flip_horizontal=flip,
+            ),
+            lambda r: r,
+            raster
+        )
+        
+        raster = jax.lax.cond(
+            state.event_state == self.consts.EVENT_PLAYER_DYING,
+            lambda r: self.jr.render_at_clipped(
+                r,
+                state.player_x,
+                state.player_y - camera_offset,
+                self.SHAPE_MASKS['player_death'],
+                flip_offset=ZERO_FLIP,
+                flip_horizontal=False,
+            ),
+            lambda r: r,
+            raster
         )
 
         # creatures
@@ -768,18 +797,33 @@ class TutankhamRenderer(JAXGameRenderer):
             )
         raster = jax.lax.fori_loop(0, 7, render_all_treasures, raster)
 
-        # Render Goal                     
-        raster = jax.lax.cond(is_onscreen(self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 1], 8, camera_offset),
-                              lambda r: self.jr.render_at_clipped(
-                                  raster,
-                                  self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 0],
-                                  self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 1] - camera_offset,
-                                  self.SHAPE_MASKS["goal"][level_index],
-                                  flip_offset=ZERO_FLIP
-                                  # self.FLIP_OFFSETS['player_group'],
-                              ),
-                              lambda r: r,
-                              raster)
+        # Render Goal Normal 
+        raster = jax.lax.cond(
+            (state.event_state != self.consts.EVENT_LEVEL_COMPLETE) & is_onscreen(self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 1], 8, camera_offset),
+            lambda r: self.jr.render_at_clipped(
+                r,
+                self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 0],
+                self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 1] - camera_offset,
+                self.SHAPE_MASKS["goal"][level_index],
+                flip_offset=ZERO_FLIP
+            ),
+            lambda r: r,
+            raster
+        )
+        
+        # Render Goal Open
+        raster = jax.lax.cond(
+            (state.event_state == self.consts.EVENT_LEVEL_COMPLETE) & is_onscreen(self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 1], 8, camera_offset),
+            lambda r: self.jr.render_at_clipped(
+                r,
+                self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 0],
+                self.consts.MAP_GOAL_POSITIONS[state.level%4, 0, 1] - camera_offset,
+                self.SHAPE_MASKS["goal_open"][level_index],
+                flip_offset=ZERO_FLIP
+            ),
+            lambda r: r,
+            raster
+        )
         # 6. Render Bullets
         bullet_frame_idx = jnp.clip(state.bullet_state[4] // self.consts.BULLET_ANIM_SPEED, 0, 3)
         raster = jax.lax.cond(state.bullet_state[3] == 1,
@@ -875,12 +919,59 @@ class TutankhamRenderer(JAXGameRenderer):
             
         raster = jax.lax.fori_loop(0, 6, render_score_digit, raster)
         # 9. Final Palette Lookup
-        return self.jr.render_from_palette(
+        rgb_image = self.jr.render_from_palette(
             raster,
             self.PALETTE,
             indices_to_update=indices_to_update,
             new_color_ids=new_color_ids
         )
+
+        def apply_ui_flash(rgb):
+            # Change colors at the same rate as the movement sprite animation (every 8 frames)
+            ui_anim_speed = 8
+            ui_frame_idx = state.step_counter // ui_anim_speed
+            
+            rng = jax.random.PRNGKey(ui_frame_idx)
+            rng_shift, rng_split, rng_signs = jax.random.split(rng, 3)
+            
+            # Generate total shift scalar (50 to 100)
+            total_shift = jax.random.randint(rng_shift, (), 50, 101)
+            
+            # Divide randomly among RGB (sum of splits = 1)
+            splits = jax.random.uniform(rng_split, (3,))
+            splits = splits / jnp.sum(splits)
+            shift_mags = jnp.round(splits * total_shift).astype(jnp.int32)
+            
+            # Randomly add or subtract
+            signs = jax.random.choice(rng_signs, jnp.array([-1, 1]), (3,))
+            shift_vec = shift_mags * signs
+            
+            # Prevent pure grey scale output by ensuring the shifts are somewhat unbalanced
+            shift_vec = jax.lax.cond(
+                jnp.max(shift_vec) - jnp.min(shift_vec) < 20,
+                lambda sv: sv.at[0].set(sv[0] + 30).at[1].set(sv[1] - 30),
+                lambda sv: sv,
+                operand=shift_vec
+            )
+            
+            y_indices = jnp.arange(self.consts.HEIGHT)[:, None, None]
+            ui_mask = (y_indices <= 35) | (y_indices >= 175)
+            
+            non_black = jnp.any(rgb > 10, axis=-1, keepdims=True)
+            non_white = jnp.logical_not(jnp.all(rgb > 240, axis=-1, keepdims=True))
+
+            new_rgb = jnp.clip(rgb + shift_vec, 0, 255)
+            
+            return jnp.where(ui_mask & non_black & non_white, new_rgb, rgb).astype(jnp.uint8)
+
+        rgb_image = jax.lax.cond(
+            state.event_state == self.consts.EVENT_LEVEL_COMPLETE,
+            apply_ui_flash,
+            lambda rgb: rgb.astype(jnp.uint8),
+            rgb_image
+        )
+
+        return rgb_image
 
 
 # ---------------------------------------------------------------------
@@ -937,6 +1028,9 @@ class JaxTutankham(JaxEnvironment):
         creature_subpixels=jnp.zeros(self.consts.MAX_CREATURES, dtype=jnp.float32)
         bullet_subpixel=0.0
 
+        event_state = self.consts.EVENT_NONE
+        event_timer = 0
+
 
         #TODO: only for testing
         # level = 12
@@ -971,7 +1065,9 @@ class JaxTutankham(JaxEnvironment):
                                last_directional_action=last_directional_action,
                                rng_key=key,
                                camera_offset=camera_offset,
-                               goal_reached=goal_reached
+                               goal_reached=goal_reached,
+                               event_state=event_state,
+                               event_timer=event_timer
                                )
         return state, state #TODO: (EnvObs, EnvState)
 
@@ -1423,7 +1519,7 @@ class JaxTutankham(JaxEnvironment):
         last_creature_spawn = jnp.int32(0)
 
         #set last_directional_action to 0, to avoid player moving immediately on respawn based on previous action
-        return respawn_x, respawn_y, bullet_state, creature_states, player_lives - 1, last_creature_spawn, 0 
+        return respawn_x, respawn_y, bullet_state, creature_states, player_lives, last_creature_spawn, 0 
 
 
 
@@ -1468,24 +1564,10 @@ class JaxTutankham(JaxEnvironment):
         player_hits = player_hits & (creature_states[:, 3] == self.consts.ACTIVE) & (creature_states[:, 5] == -1)
 
         player_hit = jnp.any(player_hits) # is true if player collides with any active creature
-
-        # Compute respawn state unconditionally, then select with jnp.where
-        (respawn_x, respawn_y,
-         respawn_bullet, respawn_creatures,
-         respawn_lives, respawn_spawn, respawn_directional_action) = self.respawn_player(player_x, player_y, player_lives, level, last_directional_action)
-
-        final_player_x = jnp.where(player_hit, respawn_x, player_x)
-        final_player_y = jnp.where(player_hit, respawn_y, player_y)
-        final_bullet_state = jnp.where(player_hit, respawn_bullet, bullet_state)
-        final_creature_states = jnp.where(player_hit, respawn_creatures, creature_states)
-        final_creature_subpixels = jnp.where(player_hit, jnp.zeros_like(creature_subpixels), creature_subpixels)
-        final_player_lives = jnp.where(player_hit, respawn_lives, player_lives)
-        final_last_creature_spawn = jnp.where(player_hit, respawn_spawn, last_creature_spawn)
-        final_last_directional_action = jnp.where(player_hit, respawn_directional_action, last_directional_action)
-
-        return (final_player_x, final_player_y,
-                final_bullet_state, final_creature_states, final_creature_subpixels,
-                final_player_lives, final_last_creature_spawn, final_last_directional_action)
+        
+        return (player_x, player_y,
+                bullet_state, creature_states, creature_subpixels,
+                player_lives, last_creature_spawn, last_directional_action, player_hit)
 
     @partial(jax.jit, static_argnums=(0,))
     def resolve_player_item_collisions(self, player_x, player_y, item_states):
@@ -1607,124 +1689,196 @@ class JaxTutankham(JaxEnvironment):
     # Step logic
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: TutankhamState, action: int):
-        level=state.level
-        player_x = state.player_x
-        player_y = state.player_y
-        tutankham_score = state.tutankham_score
-        bullet_state = state.bullet_state
-        creature_states = state.creature_states
-        item_states = state.item_states
-        laser_flash_count = state.laser_flash_count
-        last_creature_spawn = state.last_creature_spawn
-        laser_flash_cooldown = state.laser_flash_cooldown
-        amonition_timer = state.amonition_timer
-        player_lives = state.player_lives
-        has_key = state.has_key
-        last_directional_action = state.last_directional_action
-        player_direction= state.player_direction
-        step_counter = state.step_counter
-        player_subpixel = state.player_subpixel
-        creature_subpixels = state.creature_subpixels
-        bullet_subpixel = state.bullet_subpixel
-        rng_key = state.rng_key
-        camera_offset = state.camera_offset
-        goal_reached = state.goal_reached
+        
+        def normal_update(_):
+            level=state.level
+            player_x = state.player_x
+            player_y = state.player_y
+            tutankham_score = state.tutankham_score
+            bullet_state = state.bullet_state
+            creature_states = state.creature_states
+            item_states = state.item_states
+            laser_flash_count = state.laser_flash_count
+            last_creature_spawn = state.last_creature_spawn
+            laser_flash_cooldown = state.laser_flash_cooldown
+            amonition_timer = state.amonition_timer
+            player_lives = state.player_lives
+            has_key = state.has_key
+            last_directional_action = state.last_directional_action
+            player_direction= state.player_direction
+            step_counter = state.step_counter
+            player_subpixel = state.player_subpixel
+            creature_subpixels = state.creature_subpixels
+            bullet_subpixel = state.bullet_subpixel
+            rng_key = state.rng_key
+            camera_offset = state.camera_offset
+            goal_reached = state.goal_reached
+            event_state = state.event_state
+            event_timer = state.event_timer
 
-        # move player based on action input and check for teleporter trigger, also update camera offset
-        (player_x, player_y,
-         last_directional_action, player_direction,
-         is_moving, step_counter, player_subpixel, camera_offset)= self.player_step(
-            player_x, player_y,
-            action, last_directional_action,
-            player_direction, step_counter, player_subpixel, level
+            # move player based on action input and check for teleporter trigger, also update camera offset
+            (player_x, player_y,
+             last_directional_action, player_direction,
+             is_moving, step_counter, player_subpixel, camera_offset)= self.player_step(
+                player_x, player_y,
+                action, last_directional_action,
+                player_direction, step_counter, player_subpixel, level
+            )
+
+            bullet_state, bullet_subpixel, amonition_timer = self.bullet_step(bullet_state, bullet_subpixel, player_x, player_y, amonition_timer, action, level)
+
+            creature_states, creature_subpixels = self.creature_step(creature_states, creature_subpixels, camera_offset, step_counter, level, player_x, player_y, rng_key)
+
+            creature_states, last_creature_spawn, rng_key = self.spawner_step(creature_states, last_creature_spawn, level, rng_key, camera_offset, laser_flash_cooldown)
+
+            # laser flash step should go after creature step to immediately remove creatures
+            creature_states, laser_flash_cooldown, laser_flash_count, last_creature_spawn = self.laser_flash_step(creature_states, laser_flash_cooldown, laser_flash_count, last_creature_spawn, action)
+
+            # store creature_states and item_states before resolving collisions (for score update)
+            prev_creature_states = creature_states.copy()
+            prev_item_states = item_states.copy()
+            prev_lives = player_lives
+
+            # resolve bullet-creature collisions
+            creature_states, bullet_state = self.resolve_bullet_collisions(creature_states, bullet_state)
+
+            (player_x, player_y, 
+             bullet_state, creature_states, creature_subpixels,
+             player_lives, last_creature_spawn,
+             last_directional_action, player_hit
+             ) = self.resolve_player_creature_collisions(
+                 player_x, player_y,
+                 creature_states, creature_subpixels, bullet_state,
+                 player_lives, last_creature_spawn,
+                 level, last_directional_action
+                 )
+                 
+            # Deduct life instantly on hit so the score mechanism sees it
+            player_lives = player_lives - player_hit
+
+            # resolve player-item collisions
+            item_states = self.resolve_player_item_collisions(player_x, player_y, item_states)
+
+            # check if player has collected the key
+            has_key = self.check_key(item_states, has_key)
+
+            # check if player has reached the goal with the key to complete the level
+            goal_reached = self.check_goal(player_x, player_y, has_key, level)
+
+            # Update score based on creature deaths & items collected
+            tutankham_score = self.update_score(tutankham_score, 
+                                                prev_creature_states, creature_states, 
+                                                prev_item_states, item_states,
+                                                prev_lives, player_lives,
+                                                goal_reached, amonition_timer, level
+                                                )
+                                                
+            # Initiate Event State if a trigger occurred
+            new_event_state = jnp.where(player_hit, self.consts.EVENT_PLAYER_DYING, 
+                                        jnp.where(goal_reached, self.consts.EVENT_LEVEL_COMPLETE, self.consts.EVENT_NONE))
+            new_event_timer = jnp.where(player_hit, 45, 
+                                        jnp.where(goal_reached, 60, 0))
+
+            return TutankhamState(level=level,
+                                   player_x=player_x,
+                                   player_y=player_y,
+                                   tutankham_score=tutankham_score,
+                                   player_lives=player_lives,
+                                   bullet_state=bullet_state,
+                                   amonition_timer=amonition_timer,
+                                   creature_states=creature_states,
+                                   item_states=item_states,
+                                   last_creature_spawn=last_creature_spawn,
+                                   laser_flash_count=laser_flash_count,
+                                   laser_flash_cooldown=laser_flash_cooldown,
+                                   player_direction=player_direction,
+                                   is_moving=is_moving,
+                                   step_counter=step_counter,
+                                   player_subpixel=player_subpixel,
+                                   creature_subpixels=creature_subpixels,
+                                   bullet_subpixel=bullet_subpixel,
+                                   has_key=has_key,
+                                   last_directional_action=last_directional_action,
+                                   rng_key=rng_key,
+                                   camera_offset=camera_offset,
+                                   goal_reached=goal_reached,
+                                   event_state=new_event_state,
+                                   event_timer=new_event_timer
+                                   )
+
+        def event_update(_):
+            new_timer = state.event_timer - 1
+            
+            do_respawn = (state.event_state == self.consts.EVENT_PLAYER_DYING) & (new_timer == 0)
+            do_map_trans = (state.event_state == self.consts.EVENT_LEVEL_COMPLETE) & (new_timer == 0)
+            
+            (respawn_x, respawn_y,
+             respawn_bullet, respawn_creatures,
+             respawn_lives, respawn_spawn, respawn_dir_action) = self.respawn_player(state.player_x, state.player_y, state.player_lives, state.level, state.last_directional_action)
+             
+            (trans_level, trans_px, trans_py,
+             trans_bullet, trans_creatures, trans_items,
+             trans_spawn, trans_ammo, trans_cooldown,
+             trans_key, trans_flash) = self.map_transition(
+                 True, state.level,
+                 state.player_x, state.player_y, state.bullet_state,
+                 state.creature_states, state.item_states,
+                 state.last_creature_spawn, state.amonition_timer,
+                 state.laser_flash_cooldown, state.has_key, state.laser_flash_count)
+                 
+            final_x = jnp.where(do_respawn, respawn_x, jnp.where(do_map_trans, trans_px, state.player_x))
+            final_y = jnp.where(do_respawn, respawn_y, jnp.where(do_map_trans, trans_py, state.player_y))
+            final_level = jnp.where(do_map_trans, trans_level, state.level)
+            final_bullet = jnp.where(do_respawn, respawn_bullet, jnp.where(do_map_trans, trans_bullet, state.bullet_state))
+            final_creatures = jnp.where(do_respawn, respawn_creatures, jnp.where(do_map_trans, trans_creatures, state.creature_states))
+            final_csub = jnp.where(do_respawn | do_map_trans, jnp.zeros_like(state.creature_subpixels), state.creature_subpixels)
+            final_items = jnp.where(do_map_trans, trans_items, state.item_states)
+            final_spawn = jnp.where(do_respawn, respawn_spawn, jnp.where(do_map_trans, trans_spawn, state.last_creature_spawn))
+            final_dir_action = jnp.where(do_respawn, respawn_dir_action, state.last_directional_action)
+            final_ammo = jnp.where(do_map_trans, trans_ammo, state.amonition_timer)
+            final_cooldown = jnp.where(do_map_trans, trans_cooldown, state.laser_flash_cooldown)
+            final_flash = jnp.where(do_map_trans, trans_flash, state.laser_flash_count)
+            final_has_key = jnp.where(do_map_trans, trans_key, state.has_key)
+            final_lives = jnp.where(do_respawn, respawn_lives, state.player_lives)
+            final_goal_reached = jnp.where(do_map_trans, False, state.goal_reached)
+            final_event_state = jnp.where(new_timer == 0, self.consts.EVENT_NONE, state.event_state)
+            
+            return TutankhamState(level=final_level,
+                                   player_x=final_x,
+                                   player_y=final_y,
+                                   tutankham_score=state.tutankham_score,
+                                   player_lives=final_lives,
+                                   bullet_state=final_bullet,
+                                   amonition_timer=final_ammo,
+                                   creature_states=final_creatures,
+                                   item_states=final_items,
+                                   last_creature_spawn=final_spawn,
+                                   laser_flash_count=final_flash,
+                                   laser_flash_cooldown=final_cooldown,
+                                   player_direction=state.player_direction,
+                                   is_moving=state.is_moving,
+                                   step_counter=state.step_counter + 1,
+                                   player_subpixel=state.player_subpixel,
+                                   creature_subpixels=final_csub,
+                                   bullet_subpixel=state.bullet_subpixel,
+                                   has_key=final_has_key,
+                                   last_directional_action=final_dir_action,
+                                   rng_key=state.rng_key,
+                                   camera_offset=state.camera_offset,
+                                   goal_reached=final_goal_reached,
+                                   event_state=final_event_state,
+                                   event_timer=new_timer
+                                   )
+
+        new_state = jax.lax.cond(
+            state.event_timer > 0,
+            event_update,
+            normal_update,
+            operand=None
         )
 
-
-        bullet_state, bullet_subpixel, amonition_timer = self.bullet_step(bullet_state, bullet_subpixel, player_x, player_y, amonition_timer, action, level)
-
-        creature_states, creature_subpixels = self.creature_step(creature_states, creature_subpixels, camera_offset, step_counter, level, player_x, player_y, rng_key)
-
-        creature_states, last_creature_spawn, rng_key = self.spawner_step(creature_states, last_creature_spawn, level, rng_key, camera_offset, laser_flash_cooldown)
-
-        # laser flash step should go after creature step to immediately remove creatures
-        creature_states, laser_flash_cooldown, laser_flash_count, last_creature_spawn = self.laser_flash_step(creature_states, laser_flash_cooldown, laser_flash_count, last_creature_spawn, action)
-
-        # store creature_states and item_states before resolving collisions (for score update)
-        prev_creature_states = creature_states.copy()
-        prev_item_states = item_states.copy()
-        prev_lives = player_lives
-
-        # resolve bullet-creature collisions
-        creature_states, bullet_state = self.resolve_bullet_collisions(creature_states, bullet_state)
-
-        (player_x, player_y, 
-         bullet_state, creature_states, creature_subpixels,
-         player_lives, last_creature_spawn,
-         last_directional_action
-         ) = self.resolve_player_creature_collisions(
-             player_x, player_y,
-             creature_states, creature_subpixels, bullet_state,
-             player_lives, last_creature_spawn,
-             level, last_directional_action
-             )
-        
-        # resolve player-item collisions
-        item_states = self.resolve_player_item_collisions(player_x, player_y, item_states)
-
-        # check if player has collected the key
-        has_key = self.check_key(item_states, has_key)
-
-        # check if player has reached the goal with the key to complete the level
-        goal_reached = self.check_goal(player_x, player_y, has_key, level)
-
-        # Update score based on creature deaths & items collected
-        tutankham_score = self.update_score(tutankham_score, 
-                                            prev_creature_states, creature_states, 
-                                            prev_item_states, item_states,
-                                            prev_lives, player_lives,
-                                            goal_reached, amonition_timer, level
-                                            )
-        
-        # Prepares state for the next level if goal is reached for current level
-        (level, player_x, player_y,
-         bullet_state, creature_states, item_states,
-         last_creature_spawn, amonition_timer, laser_flash_cooldown,
-         has_key, laser_flash_count) = self.map_transition(
-             goal_reached, level,
-             player_x, player_y, bullet_state,
-             creature_states, item_states,
-             last_creature_spawn, amonition_timer,
-             laser_flash_cooldown, has_key, laser_flash_count)
-
-
-
-        state = TutankhamState(level=level,
-                               player_x=player_x,
-                               player_y=player_y,
-                               tutankham_score=tutankham_score,
-                               player_lives=player_lives,
-                               bullet_state=bullet_state,
-                               amonition_timer=amonition_timer,
-                               creature_states=creature_states,
-                               item_states=item_states,
-                               last_creature_spawn=last_creature_spawn,
-                               laser_flash_count=laser_flash_count,
-                               laser_flash_cooldown=laser_flash_cooldown,
-                               player_direction=player_direction,
-                               is_moving=is_moving,
-                               step_counter=step_counter,
-                               player_subpixel=player_subpixel,
-                               creature_subpixels=creature_subpixels,
-                               bullet_subpixel=bullet_subpixel,
-                               has_key=has_key,
-                               last_directional_action=last_directional_action,
-                               rng_key=rng_key,
-                               camera_offset=camera_offset,
-                               goal_reached=goal_reached
-                               )
-
         reward = 0.0
-        done = self._get_done(state)
+        done = self._get_done(new_state)
         info = 0
 
         #jax.debug.print("Player position: ({}, {})", player_x, player_y)
@@ -1732,7 +1886,7 @@ class JaxTutankham(JaxEnvironment):
         #jax.debug.print("ammonition: ({})", amonition_timer)
         #jax.debug.print("Score: ({})", tutankham_score)
         # return observation, new_state, env_reward, done, info
-        return state, state, reward, done, info
+        return new_state, new_state, reward, done, info
 
     # -----------------------------
     # Rendering 
@@ -1757,6 +1911,6 @@ class JaxTutankham(JaxEnvironment):
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: TutankhamState) -> bool:
-        game_over = state.player_lives <= 0
+        game_over = (state.player_lives <= 0) & (state.event_state != self.consts.EVENT_PLAYER_DYING)
         beat_game = state.level >= 16
         return jnp.logical_or(game_over, beat_game)
